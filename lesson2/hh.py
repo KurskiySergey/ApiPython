@@ -3,8 +3,49 @@ import requests
 from pprint import pprint
 import json
 import os
+import pymongo
+from pymongo.errors import DuplicateKeyError
+import hashlib
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+HOST = '127.0.0.1'
+PORT = 27017
+DB_NAME = "vacancies"
+
+
+class MongoDB:
+    def __init__(self, db_name, server_addr: tuple):
+        self.host = server_addr[0]
+        self.port = server_addr[1]
+        self.db_name = db_name
+        self.__client = pymongo.MongoClient(host=self.host, port=self.port)
+        self.db = self.__client[self.db_name]
+        self.db_collections = self.db.list_collection_names()
+
+    def add_collection(self, collection_name):
+        if collection_name not in self.db_collections:
+            self.db.create_collection(name=collection_name)
+            self.db_collections.append(collection_name)
+
+    def get_collection(self, collection_name):
+        if collection_name in self.db_collections:
+            return self.db.get_collection(collection_name)
+        return self.db.get_collection(self.db_collections[0])
+
+    def drop_db(self):
+        self.__client.drop_database(self.db_name)
+
+    def show_all(self):
+        for collection in self.db_collections:
+            print(f'Collection {collection}')
+            info = self.get_collection(collection).find({})
+            pprint(list(info))
+            print()
+
+    def filter_by_price(self, collection_name, min_price):
+        collection = self.get_collection(collection_name)
+        total_list = collection.find({'price': {"$gt": min_price}})
+        return VacancyList(total_list)
 
 
 class VacancyList(list):
@@ -26,8 +67,19 @@ class VacancyList(list):
                                   key=lambda vacancy: vacancy.get("price")[0] if vacancy.get("price")[
                                                                                      0] is not None else 0))
 
-    def limit_by(self, value: int):
-        return self[:value]
+    def limit_by(self, value: int, start_index: int = None):
+        if start_index:
+            if value:
+                if start_index + value > len(self):
+                    value = len(self) - start_index
+                return VacancyList(self[start_index:start_index+value])
+            else:
+                return VacancyList(self[start_index:])
+        else:
+            if value:
+                return VacancyList(self[:value])
+            else:
+                return self
 
     def filter_by(self, category: str, value):
         if value is None:
@@ -59,6 +111,23 @@ class VacancyList(list):
                 json.dump(self.copy(), vacancies, ensure_ascii=False)
             except json.JSONDecodeError:
                 vacancies.write(str(self))
+
+    def add_to_mongo_collection(self, collection, unique_key: str = None):
+        if unique_key is None:
+            for vacancy in self:
+                collection.insert_one(vacancy)
+
+        else:
+            for vacancy in self:
+                try:
+                    vacancy_value = vacancy.get(unique_key)
+                    unique_value = json.dumps(vacancy_value).encode('utf-8')
+                    unique_value_hash_id = hashlib.md5(unique_value).hexdigest()
+                    _id = {"_id": unique_value_hash_id}
+                    vacancy.update(_id)
+                    collection.insert_one(vacancy)
+                except DuplicateKeyError:
+                    print(f"data with this unique data:{unique_key} exists already")
 
 
 class HeadHunter:
@@ -220,11 +289,23 @@ class HeadHunter:
         return vacancy_page_list
 
 
-if __name__ == "__main__":
+def start_db(collection_name, drop=False):
+    mongo_db = MongoDB(db_name=DB_NAME, server_addr=(HOST, PORT))
+    if drop:
+        mongo_db.drop_db()
+    mongo_db.add_collection(collection_name=collection_name)
+
+    return mongo_db
+
+
+def scrap_site(mongo_db, collection_name):
+    # getting data from user
     search = input("Введите критерий поиска: ")
     till_page = input("Введите ограничение по страницам (Если не важно нажмите enter): ")
     wish_address = input("Введите желаемый город (Если не важно нажмите enter): ")
     wish_min_price = input("Минимальный порог (Если не важно нажмите enter): ")
+    limit = input("Ограничить результат до (Если не важно нажмите enter): ")
+    save_to_db = input("Сохранить результат в базе данных? y - да, n - нет: ")
 
     if till_page == "":
         till_page = None
@@ -239,10 +320,58 @@ if __name__ == "__main__":
     else:
         wish_min_price = float(wish_min_price)
 
+    if limit == "":
+        limit = None
+    else:
+        limit = int(limit)
+
+    # creating headhunter scraper and mongo collection
     hh = HeadHunter()
+
+    # scrap for info
     find_vacancies = hh.find_vacancy(search=search, till_page=till_page)
+    # save find result
     find_vacancies.save_to_file(filename="result.json")
+    # filter info according to user data
     filter_vacancies = \
         find_vacancies.filter_by(category="address", value=wish_address).order_by_max_price(desc=True). \
-            filter_by(category="min_price", value=wish_min_price).limit_by(5)
+            filter_by(category="min_price", value=wish_min_price).limit_by(limit)
+    # print filter result
     pprint(filter_vacancies)
+    print()
+    # add result to mongo
+    if save_to_db.lower() == 'y':
+        filter_vacancies.add_to_mongo_collection(collection=mongo_db.get_collection(collection_name), unique_key='name')
+
+
+def mongo_search(mongo_db, collection_name):
+    # mongo filter
+    print("Посик данных в базе данных...")
+    prefer_price = float(input("Введите желаемую заработную плату: "))
+    page_limit = int(input("Количество вакансий в одной странице: "))
+    filter_data = mongo_db.filter_by_price(collection_name, min_price=prefer_price).order_by_max_price(desc=True)
+    print(f"Найдено вакансий - > {len(filter_data)}")
+    pages = len(filter_data) // page_limit + 1
+    page_count = 0
+    start_index = 0
+    while page_count < pages:
+        pprint(filter_data.limit_by(page_limit, start_index=start_index))
+        page_count += 1
+        start_index += page_limit
+        input(f"page {page_count}/{pages} press enter: \n")
+
+
+if __name__ == "__main__":
+    collection_name = 'vacancies'
+    mongo_db = start_db(collection_name, drop=False)
+
+    while True:
+        print("Для выхода нажмите q")
+        use_db = input("Использовать существующую базу или сделать запрос на сайт? y - да, n - нет: ")
+        if use_db.lower() == 'y':
+            mongo_search(mongo_db, collection_name)
+        elif use_db.lower() == "q":
+            break
+        else:
+            scrap_site(mongo_db, collection_name)
+
